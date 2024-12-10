@@ -11,6 +11,13 @@ from typing import List, Optional, Tuple
 import torch
 import transformers
 
+from self_speculation.generator_base import (
+    GenerationConfig,
+    GenerationStrategy,
+    GenerationStrategyResult,
+)
+
+
 @dataclass
 class ForwardResult:
     logits: torch.Tensor
@@ -389,3 +396,365 @@ def forward_remainder(
     return ForwardResult(
         logits=logits, past_key_values=past_key_values, exit_query_cache=exit_query_cache
     )
+    
+def forward_with_layerdrop_ffn(
+    model: transformers.LlamaForCausalLM,
+    input_ids: torch.Tensor,
+    past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]],
+    exit_layer: int,
+    exit_query_cache: Optional[List[torch.Tensor]],
+) -> ForwardResult:
+    device = input_ids.device
+    batch_size, seq_length = input_ids.shape
+
+    seq_length_with_past = seq_length
+    past_key_values_length = 0
+
+    if past_key_values is not None:
+        past_key_values_length = past_key_values[0][0].shape[2]
+        seq_length_with_past = seq_length_with_past + past_key_values_length
+    past_key_values = transformers.cache_utils.DynamicCache.from_legacy_cache(past_key_values)
+
+    position_ids = torch.arange(
+        past_key_values_length,
+        seq_length + past_key_values_length,
+        dtype=torch.long,
+        device=device,
+    )
+    position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+    attention_mask = input_ids.new_ones(
+        (batch_size, seq_length_with_past),
+        dtype=torch.bool,
+    )
+    inputs_embeds = model.model.embed_tokens(input_ids)
+    attention_mask = _prepare_decoder_attention_mask(
+        model,
+        attention_mask,
+        (batch_size, seq_length),
+        inputs_embeds,
+        past_key_values_length,
+    )
+
+    hidden_states = inputs_embeds
+    for decoder_layer in model.model.layers:
+        if torch.rand(1).item() < GenerationConfig.layerdrop_prob:
+            attn_output, _, past_key_values = decoder_layer.self_attn(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=True,
+                use_cache=True,
+            )
+            hidden_states = attn_output
+        else:
+            hidden_states, past_key_values = decoder_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=False,
+                use_cache=True,
+            )
+            
+    if past_key_values is not None:
+        past_key_values = past_key_values.to_legacy_cache()
+
+    # past_key_values = past_key_values.to_legacy_cache()
+
+    # next_cache = next_decoder_cache
+    if exit_query_cache is None:
+        exit_query_cache = hidden_states
+    else:
+        exit_query_cache = torch.cat([exit_query_cache, hidden_states], dim=1)
+
+    hidden_states = model.model.norm(hidden_states)
+
+    logits = model.lm_head(hidden_states)
+    return ForwardResult(
+        logits=logits, past_key_values=past_key_values, exit_query_cache=exit_query_cache
+    )
+
+
+def forward_early_with_layerdrop_ffn(
+    model: transformers.LlamaForCausalLM,
+    input_ids: torch.Tensor,
+    past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]],
+    exit_layer: int,
+    exit_query_cache: Optional[List[torch.Tensor]],
+) -> ForwardResult:
+    device = input_ids.device
+    batch_size, seq_length = input_ids.shape
+
+    seq_length_with_past = seq_length
+    past_key_values_length = 0
+
+    if past_key_values is not None:
+        past_key_values_length = past_key_values[0][0].shape[2]
+        seq_length_with_past = seq_length_with_past + past_key_values_length
+    past_key_values = transformers.cache_utils.DynamicCache.from_legacy_cache(past_key_values)
+
+    position_ids = torch.arange(
+        past_key_values_length,
+        seq_length + past_key_values_length,
+        dtype=torch.long,
+        device=device,
+    )
+    position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+    attention_mask = input_ids.new_ones(
+        (batch_size, seq_length_with_past),
+        dtype=torch.bool,
+    )
+    inputs_embeds = model.model.embed_tokens(input_ids)
+    attention_mask = _prepare_decoder_attention_mask(
+        model,
+        attention_mask,
+        (batch_size, seq_length),
+        inputs_embeds,
+        past_key_values_length,
+    )
+
+    hidden_states = inputs_embeds
+    for decoder_layer in model.model.layers[:exit_layer]:
+
+        if torch.rand(1).item() < GenerationConfig.layerdrop_prob:
+            attn_output, _, past_key_values = decoder_layer.self_attn(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=True,
+                use_cache=True,
+            )
+            hidden_states = attn_output
+        else:
+            hidden_states, past_key_values = decoder_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=False,
+                use_cache=True,
+            )
+            
+    if past_key_values is not None:
+        past_key_values = past_key_values.to_legacy_cache()
+
+    # past_key_values = past_key_values.to_legacy_cache()
+
+    # next_cache = next_decoder_cache
+    if exit_query_cache is None:
+        exit_query_cache = hidden_states
+    else:
+        exit_query_cache = torch.cat([exit_query_cache, hidden_states], dim=1)
+
+    hidden_states = model.model.norm(hidden_states)
+
+    logits = model.lm_head(hidden_states)
+    return ForwardResult(
+        logits=logits, past_key_values=past_key_values, exit_query_cache=exit_query_cache
+    )
+
+def forward_early_with_layerdrop_atten(
+    model: transformers.LlamaForCausalLM,
+    input_ids: torch.Tensor,
+    past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]],
+    exit_layer: int,
+    exit_query_cache: Optional[List[torch.Tensor]],
+) -> ForwardResult:
+    device = input_ids.device
+    batch_size, seq_length = input_ids.shape
+
+    seq_length_with_past = seq_length
+    past_key_values_length = 0
+
+    if past_key_values is not None:
+        past_key_values_length = past_key_values[0][0].shape[2]
+        seq_length_with_past = seq_length_with_past + past_key_values_length
+        
+    past_key_values = transformers.cache_utils.DynamicCache.from_legacy_cache(past_key_values)
+    
+    position_ids = torch.arange(
+        past_key_values_length,
+        seq_length + past_key_values_length,
+        dtype=torch.long,
+        device=device,
+    )
+    position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+    attention_mask = input_ids.new_ones(
+        (batch_size, seq_length_with_past),
+        dtype=torch.bool,
+    )
+    inputs_embeds = model.model.embed_tokens(input_ids)
+    
+    attention_mask = _prepare_decoder_attention_mask(
+        model,
+        attention_mask,
+        (batch_size, seq_length),
+        inputs_embeds,
+        past_key_values_length,
+    )
+
+    hidden_states = inputs_embeds
+    # print(f"Initial hidden_states shape: {hidden_states.shape}")
+    
+    # for decoder_layer in model.model.layers[:exit_layer]:
+    for decoder_layer in model.model.layers[:exit_layer]:
+        if torch.rand(1).item() < GenerationConfig.layerdrop_prob:
+             # skip Attention，just implement FFN
+            hidden_states = decoder_layer.input_layernorm(hidden_states)  # LayerNorm
+            ffn_output = decoder_layer.mlp(hidden_states)  # MLP
+            ffn_output = F.dropout(ffn_output, p=0.2) #dropout
+            hidden_states = hidden_states + ffn_output  # Residual
+            hidden_states = decoder_layer.input_layernorm(hidden_states)
+        else:
+            hidden_states, past_key_values = decoder_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=False,
+                use_cache=True,
+            )
+
+    past_key_values = past_key_values.to_legacy_cache()
+    # print(f"past_key_values shape after legacy conversion: {[x[0].shape for x in past_key_values]}")
+
+    # next_cache = next_decoder_cache
+    if exit_query_cache is None:
+        exit_query_cache = hidden_states
+    else:
+        exit_query_cache = torch.cat([exit_query_cache, hidden_states], dim=1)
+
+    hidden_states = model.model.norm(hidden_states)
+    
+    # print(f"hidden_states shape after normalization: {hidden_states.shape}")
+
+    logits = model.lm_head(hidden_states)
+    # print(f"Final logits shape: {logits.shape}")
+
+    return ForwardResult(
+        logits=logits, past_key_values=past_key_values, exit_query_cache=exit_query_cache
+    )
+
+
+
+def forward_early_with_layerdrop_all(
+    model: transformers.LlamaForCausalLM,
+    input_ids: torch.Tensor,
+    past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]],
+    exit_layer: int,
+    exit_query_cache: Optional[List[torch.Tensor]],
+) -> ForwardResult:
+    device = input_ids.device
+    batch_size, seq_length = input_ids.shape
+
+    seq_length_with_past = seq_length
+    past_key_values_length = 0
+    
+    dtype = model.dtype
+    device = model.device 
+    token_size = 0
+    
+    if past_key_values is not None and isinstance(past_key_values[0][0], list):
+        for i, layer in enumerate(past_key_values):
+            if layer is not None and not isinstance(layer[0], list):
+                token_size = layer[0].shape[2]
+                print("token_size", token_size)
+
+
+        new_past_key_values = []
+        for layer in past_key_values:
+            new_layer = [] 
+            for component in layer:
+                if isinstance(component, list) and len(component) == 0:  
+                    new_layer.append(torch.zeros(1, 32, token_size, 128, dtype=dtype).to(device))
+                else:
+                    new_layer.append(component)
+            new_past_key_values.append(tuple(new_layer))
+        
+        past_key_values = new_past_key_values
+    
+ 
+        
+    if past_key_values is not None and isinstance(past_key_values[0][0], list):
+
+        new_past_key_values = []
+        for layer in past_key_values:
+            new_layer = []  
+            for component in layer:
+                if isinstance(component, list) and len(component) == 0:  
+                    # new_layer.append(torch.zeros(1, 32, token_size, 128, dtype=dtype).to(device))
+                    continue
+                else:
+                    new_layer.append(component)
+            new_past_key_values.append(tuple(new_layer))
+        
+        past_key_values = new_past_key_values
+        
+    
+    if past_key_values is not None:
+        past_key_values_length = past_key_values[0][0].shape[2]
+        seq_length_with_past = seq_length_with_past + past_key_values_length
+    past_key_values = transformers.cache_utils.DynamicCache.from_legacy_cache(past_key_values)
+    
+
+    position_ids = torch.arange(
+        past_key_values_length,
+        seq_length + past_key_values_length,
+        dtype=torch.long,
+        device=device,
+    )
+    position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+    attention_mask = input_ids.new_ones(
+        (batch_size, seq_length_with_past),
+        dtype=torch.bool,
+    )
+    inputs_embeds = model.model.embed_tokens(input_ids)
+    attention_mask = _prepare_decoder_attention_mask(
+        model,
+        attention_mask,
+        (batch_size, seq_length),
+        inputs_embeds,
+        past_key_values_length,
+    )
+
+    hidden_states = inputs_embeds
+    for decoder_layer in model.model.layers[:exit_layer]:
+        # print(f"BF: Type of past_key_values: {type(past_key_values)}")
+        dropout_probability = random.uniform(0, 1)
+        if dropout_probability < GenerationConfig.layerdrop_prob:
+            # past_key_values = past_key_values.to_legacy_cache()
+            continue
+        
+        if isinstance(past_key_values, tuple):
+            past_key_values = transformers.cache_utils.DynamicCache.from_legacy_cache(past_key_values)
+        
+        hidden_states, past_key_values = decoder_layer(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_values,
+            output_attentions=False,
+            use_cache=True,
+            padding_mask=None,
+        )
+        # print(f"Type after decoder_layer: {type(past_key_values)}")
+
+    past_key_values = past_key_values.to_legacy_cache()
+
+    # next_cache = next_decoder_cache
+    if exit_query_cache is None:
+        exit_query_cache = hidden_states
+    else:
+        exit_query_cache = torch.cat([exit_query_cache, hidden_states], dim=1)
+
+    hidden_states = model.model.norm(hidden_states)
+
+    logits = model.lm_head(hidden_states)
+    return ForwardResult(
+        logits=logits, past_key_values=past_key_values, exit_query_cache=exit_query_cache
+    )
+
+
+
