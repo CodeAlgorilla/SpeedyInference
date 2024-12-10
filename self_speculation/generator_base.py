@@ -42,6 +42,7 @@ class GenerationConfig:
     top_p: float = 0.9
     no_repeat_ngram_size: int = None
     stop_words: List[str] = None
+    layerdrop_prob = 0.2
 
 
 class GenerationStrategy:
